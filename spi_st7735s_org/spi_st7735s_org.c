@@ -57,6 +57,7 @@ static struct st7735s_dev st7735sdev;
 
 void st7735s_reginit(struct st7735s_dev *dev);
 
+/* st7735s指令集 */
 struct spi_lcd_cmd {
     u8  reg_addr; // command
     u8  len;  //需要从spi_lcd_datas数组里发出数据字节数
@@ -83,6 +84,7 @@ struct spi_lcd_cmd cmds[] = {
 	{0x3A, 1, 10},
 	{0x29, 1, 10},
 };
+/* st7735s数据集 */
 u8 spi_lcd_datas[] = {
 	0x01,0x2C,0x2D,
 	0x01,0x2C,0x2D,
@@ -106,8 +108,7 @@ u8 spi_lcd_datas[] = {
 /*
  * @description	: 向st7735s多个寄存器写入数据
  * @param - dev:  st7735s设备
- * @param - reg:  要写入的寄存器首地址
- * @param - val:  要写入的数据缓冲区
+ * @param - buf:  要写入的数据
  * @param - len:  要写入的数据长度
  * @return 	  :   操作结果
  */
@@ -131,8 +132,7 @@ static s32 st7735s_write_regs(struct st7735s_dev *dev, u8 *buf, u8 len)
 /*
  * @description	: 向st7735s指定寄存器写入指定的值，写一个寄存器
  * @param - dev:  st7735s设备
- * @param - reg:  要写的寄存器
- * @param - data: 要写入的值
+ * @param - buf: 要写入的值
  * @return   :    无
  */	
 static void st7735s_write_onereg(struct st7735s_dev *dev, u8 buf)
@@ -154,6 +154,7 @@ void write_command(struct st7735s_dev *dev, u8 cmd)
 */
 void write_data(struct st7735s_dev *dev, u8 data)
 {
+	// dc , command:1
     gpio_set_value(dev->dc_gpio, 1);
     st7735s_write_onereg(dev,data);
 }
@@ -367,7 +368,7 @@ static int st7735s_probe(struct spi_device *spi)
 		return PTR_ERR(st7735sdev.device);
 	}
 
-	/* 获取设备树中cs片选信号 */
+	/* 获取设备树中cs片选信号，请根据实际设备树修改*/
 	st7735sdev.nd = of_find_node_by_path("/soc/aips-bus@2000000/spba-bus@2000000/ecspi@2008000");
 	if(st7735sdev.nd == NULL) {
 		printk("ecspi1 node not find!\r\n");
@@ -379,7 +380,7 @@ static int st7735s_probe(struct spi_device *spi)
 		goto get_err;
 	}
 
-	/* 获取设备树中Res复位, DC(data or command), BL GPIO */
+	/* 获取设备树中Res复位, DC(data or command), BL GPIO ，请根据实际设备树修改*/
 	st7735sdev.nd = of_find_node_by_path("/soc/aips-bus@2000000/spba-bus@2000000/ecspi@2008000/st7735s@0");
 	if(st7735sdev.nd == NULL) {
 		printk("st7735s node not find!\r\n");

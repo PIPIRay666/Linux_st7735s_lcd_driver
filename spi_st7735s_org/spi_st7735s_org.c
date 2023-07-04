@@ -1,3 +1,8 @@
+/*
+ * @author: PeiRui Wang
+ * @description: st7735s lcd SPI driver, test on Fire IMX6ULL board
+ * @year :  2023
+ */
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>

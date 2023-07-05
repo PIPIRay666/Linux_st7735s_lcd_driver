@@ -1,6 +1,6 @@
 /*
  * @author: PeiRui Wang
- * @description: st7735s lcd SPI driver, test on Fire IMX6ULL board
+ * @description: st7735s lcd SPI driver (framebuffer), test on Fire IMX6ULL board
  * @kernel version: Linux_4.19.35
  * @year :  2023
  */
@@ -27,8 +27,7 @@
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <linux/spi/spi.h>
-
-#include<image.h>
+#include <linux/fb.h>
 
 #define st7735s_CNT	1
 #define st7735s_NAME	"st7735s"
@@ -36,8 +35,8 @@
 #define DISP_W 160
 #define DISP_H 128
 
-#define LCD_W DISP_W+1
-#define LCD_H DISP_H+2
+#define LCD_W DISP_W//+1
+#define LCD_H DISP_H//+2
 
 #define RED  		0xf800
 #define GREEN		0x07e0
@@ -111,6 +110,144 @@ u8 spi_lcd_datas[] = {
 	0x05,
 };
 
+
+void st7735s_fb_show(struct fb_info *fbi, struct spi_device *spi);
+static int st7735s_fb_setcolreg(unsigned int regno, unsigned int red,
+			     unsigned int green, unsigned int blue,
+			     unsigned int transp, struct fb_info *info);
+/* framebuffer资源 */
+typedef struct {
+    struct spi_device *spi; //记录fb_info对象对应的spi设备对象
+    struct task_struct *thread; //记录线程对象的地址，此线程专用于把显存数据发送到屏的驱动ic
+} st7735s_data_t;
+struct fb_info *fbi;
+struct fb_ops fops = {
+    .owner		= THIS_MODULE,
+    .fb_setcolreg	=  st7735s_fb_setcolreg,  //实现颜色寄存器设置函数
+    .fb_fillrect	= cfb_fillrect,
+	.fb_copyarea	= cfb_copyarea,
+	.fb_imageblit	= cfb_imageblit,
+};
+
+int fb_thread_func(void *data)
+{
+   printk("===========%s : %s=============\n", __FUNCTION__, "fb thread running...........");
+    st7735s_data_t *ldata = fbi->par;
+
+    while (1)
+    {   
+        if (kthread_should_stop())
+            break;
+        st7735s_fb_show(fbi, ldata->spi);
+    }
+
+    return 0;
+}
+
+static u32 pseudo_palette[LCD_W*LCD_H];
+/*fb_bitfield结构体：fb缓存的RGB位域，该结构描述每一个像素显示缓冲区的组织方式，
+假如为RGB565模式，R占5位=bit[11:15]，G占6位=bit[10:5] B占5位=bit[4:0] */
+static inline unsigned int chan_to_field(unsigned int chan, struct fb_bitfield *bf)
+{
+	chan &= 0xffff;
+	chan >>= 16 - bf->length;
+	return chan << bf->offset;
+}
+/* 颜色寄存器设置函数 */
+static int st7735s_fb_setcolreg(unsigned int regno, unsigned int red,
+			     unsigned int green, unsigned int blue,
+			     unsigned int transp, struct fb_info *info)
+{
+	unsigned int val;
+	
+	if (regno > 16)
+	{
+		return 1;
+	}
+
+	/* 用red,green,blue三原色构造出val  */
+	val  = chan_to_field(red,	&info->var.red);
+	val |= chan_to_field(green, &info->var.green);
+	val |= chan_to_field(blue,	&info->var.blue);
+	
+	pseudo_palette[regno] = val;
+	return 0;
+}
+/* framebuffer创建函数 */
+int st7735s_fb_create(struct spi_device *spi) //此函数在spi设备驱动的probe函数里被调用
+{
+	printk("===========%s : %s=============\n", __FUNCTION__, "start.");
+    u8 *v_addr;
+    u32 p_addr;
+    st7735s_data_t *data;
+	int X=LCD_H;
+	int Y=LCD_W;
+    /*
+        coherent:连贯的
+        分配连贯的物理内存
+    */
+    v_addr = dma_alloc_coherent(NULL, LCD_W*LCD_H*4, &p_addr, GFP_KERNEL);
+	printk("===========%s : %s=============\n", __FUNCTION__, "dma_alloc_coherent (Done).");
+    
+    //额外分配st7735s_data_t类型空间
+    fbi = framebuffer_alloc(sizeof(st7735s_data_t), NULL);
+    if(fbi == NULL){
+		printk("st7735s fbi alloc error!\n");
+        return -1;
+    }
+    data = fbi->par; //data指针指向额外分配的空间
+    data->spi = spi;
+
+    fbi->pseudo_palette = pseudo_palette;
+	fbi->var.activate       = FB_ACTIVATE_NOW;
+
+    fbi->var.xres = LCD_H;
+    fbi->var.yres = LCD_W;
+    fbi->var.xres_virtual = X;
+    fbi->var.yres_virtual = Y;
+    fbi->var.bits_per_pixel = 32; // 屏是rgb565, 但QT程序只能支持32位.还需要在刷图时把32位的像素数据转换成rgb565
+    // fbi->var.red.offset = 11;
+    // fbi->var.red.length = 5;
+    // fbi->var.green.offset = 5;
+    // fbi->var.green.length = 6;
+    // fbi->var.blue.offset = 0;
+    // fbi->var.blue.length = 5;
+    fbi->var.red.offset = 16;
+    fbi->var.red.length = 8;
+    fbi->var.green.offset = 8;
+    fbi->var.green.length = 8;
+    fbi->var.blue.offset = 0;
+    fbi->var.blue.length = 8;
+
+    strcpy(fbi->fix.id, "st7735s_fb");
+    fbi->fix.smem_start = p_addr; //显存的物理地址
+    fbi->fix.smem_len = X*Y*4; 
+    fbi->fix.type = FB_TYPE_PACKED_PIXELS;
+    fbi->fix.visual = FB_VISUAL_TRUECOLOR;
+    fbi->fix.line_length = X*4;
+
+    fbi->fbops = &fops;
+    fbi->screen_base = v_addr; //显存虚拟地址
+    fbi->screen_size = X*Y*4; //显存大小
+
+    register_framebuffer(fbi);
+	printk("===========%s : %s=============\n", __FUNCTION__, "register_framebuffer (Done).");
+    data->thread = kthread_run(fb_thread_func, fbi, spi->modalias);
+
+	printk("===========%s  :  %s=============\n", __FUNCTION__, "end.");
+    return 0;    
+}
+
+/* framebuffer删除函数 */
+void st7735s_fb_delete(void) //此函数在spi设备驱动remove时被调用
+{
+    st7735s_data_t *data = fbi->par;
+    kthread_stop(data->thread); //让刷图线程退出
+    unregister_framebuffer(fbi);
+    dma_free_coherent(NULL, fbi->screen_size, fbi->screen_base, fbi->fix.smem_start);
+    framebuffer_release(fbi);
+}
+
 /*
  * @description	: 向st7735s多个寄存器写入数据
  * @param - dev:  st7735s设备
@@ -118,12 +255,11 @@ u8 spi_lcd_datas[] = {
  * @param - len:  要写入的数据长度
  * @return 	  :   操作结果
  */
-static s32 st7735s_write_regs(struct st7735s_dev *dev, u8 *buf, u8 len)
+static s32 st7735s_write_regs(struct spi_device *spi, u8 *buf, u32 len)
 {
 	int ret;
 	struct spi_message m;
 	struct spi_transfer *t;
-	struct spi_device *spi = (struct spi_device *)dev->private_data;
 	t = kzalloc(sizeof(struct spi_transfer), GFP_KERNEL);	/* 申请内存 */
 	/* 发送要写入的数据 */
 	t->tx_buf = buf;			/* 要写入的数据 */
@@ -141,36 +277,35 @@ static s32 st7735s_write_regs(struct st7735s_dev *dev, u8 *buf, u8 len)
  * @param - buf: 要写入的值
  * @return   :    无
  */	
-static void st7735s_write_onereg(struct st7735s_dev *dev, u8 buf)
+static void st7735s_write_onereg(struct spi_device *spi, u8 buf)
 {
-	st7735s_write_regs(dev,&buf, 1);
-    //spi_write(dev,&buf, 1);
+	st7735s_write_regs(spi,&buf, 1);
 }
 /*
     funciton: 写一个命令
 */
-void write_command(struct st7735s_dev *dev, u8 cmd)
+void write_command(struct spi_device *spi, u8 cmd)
 {
     // dc , command:0
-    gpio_set_value(dev->dc_gpio, 0); 
-    st7735s_write_onereg(dev,cmd);
+    gpio_set_value(st7735sdev.dc_gpio, 0); 
+    st7735s_write_onereg(spi,cmd);
 }
 /*
     funciton: 写一个数据
 */
-void write_data(struct st7735s_dev *dev, u8 data)
+void write_data(struct spi_device *spi, u8 data)
 {
 	// dc , command:1
-    gpio_set_value(dev->dc_gpio, 1);
-    st7735s_write_onereg(dev,data);
+    gpio_set_value(st7735sdev.dc_gpio, 1);
+    st7735s_write_onereg(spi,data);
 }
 /*
     funciton: 写多个数据
 */
-static void write_datas(struct st7735s_dev *dev, int data,int len)
+static void write_datas(struct spi_device *spi, u8 *data, u32 len)
 {
-    gpio_set_value(dev->dc_gpio, 1);
-    st7735s_write_regs(dev,(u8 *)&data,len);
+    gpio_set_value(st7735sdev.dc_gpio, 1);
+    st7735s_write_regs(spi,data,len);
 }
 
 /*
@@ -205,84 +340,74 @@ static const struct file_operations st7735s_ops = {
 };
 
 /* 写入屏幕地址函数 */
-void Address_set(struct st7735s_dev *dev,unsigned int x1,unsigned int y1,unsigned int x2,unsigned int y2)
+void Address_set(struct spi_device *spi, unsigned int x1, unsigned int y1, unsigned int x2, unsigned int y2)
 { 
-    write_command(dev,0x2a);
-    write_data(dev,x1>>8);
-    write_data(dev,x1);
-    write_data(dev,x2>>8);
-    write_data(dev,x2);
-    write_command(dev,0x2b);
-    write_data(dev,y1>>8);
-    write_data(dev,y1);
-    write_data(dev,y2>>8);
-    write_data(dev,y2);
-    write_command(dev,0x2C);					 						 
+    write_command(spi,0x2a);
+    write_data(spi,x1>>8);
+    write_data(spi,x1);
+    write_data(spi,x2>>8);
+    write_data(spi,x2);
+    write_command(spi,0x2b);
+    write_data(spi,y1>>8);
+    write_data(spi,y1);
+    write_data(spi,y2>>8);
+    write_data(spi,y2);
+    write_command(spi,0x2C);					 						 
 }
+
 /*
     全屏填充函数
 */
 void LCD_Set_color(struct st7735s_dev *dev, u16 Color)
 {
 	u16 i,j;  	
-	Address_set(dev,0,0,LCD_W-1,LCD_H-1);
+	Address_set(dev->private_data,0,0,LCD_W-1,LCD_H-1);
     for(i=0;i<LCD_W;i++)
 	 {
 	  for (j=0;j<LCD_H;j++)
 	   	{
         	//write_datas(dev,Color,2);	
-			write_data(dev,Color>>8);
-            write_data(dev,Color);
+			write_data(dev->private_data,Color>>8);
+            write_data(dev->private_data,Color);
 	    }
 	  }
 }
-/*
-    区域填充函数
-*/
-void LCD_Set_area_color(struct st7735s_dev *dev, unsigned int x1, unsigned int y1, unsigned int x2, unsigned int y2, u16 Color)
-{
-	Address_set(dev,x1,y1,x2,y2);
-	//计算填充区域的长度和宽度，终点坐标减起点坐标+1
-	unsigned int x_len = x2 - x1 + 1;//计算x坐标的长度
-	unsigned int y_len = y2 - y1 + 1;//计算y坐标的长度
-	int i, j;
-	for(i = 0; i < x_len; i++)
-	{
-		for(j = 0; j < y_len; j++)
-		{
-			write_data(dev,Color>>8);
-            write_data(dev,Color);
-		}
-	}
-}
-/*
-    描点函数
-*/
-void LCD_Set_point_color(struct st7735s_dev *dev, unsigned int x, unsigned int y, u16 Color)
-{
-	Address_set(dev,x,y,x,y);
 
-	write_data(dev,Color>>8);
-    write_data(dev,Color);
-}
-/*
-    图片显示
-*/
-void LCD_Set_image(struct st7735s_dev *dev, const unsigned char *p) //显示图片
+/* framebuffer线程刷屏函数 */
+void st7735s_fb_show(struct fb_info *fbi, struct spi_device *spi)
 {
-	unsigned char picH,picL;
-	LCD_Set_color(dev, WHITE); //清屏  
-
-	Address_set(dev,0,0,LCD_W-2,LCD_H-3);
-	uint16_t i=0;
-	for(i=0;i<20480;i++)
-	 {	
-		picL=*(p+i*2);	//数据低位在前
-		picH=*(p+i*2+1);				
-	   	//write_datas(dev, picH<<8|picL,2);  
-    	write_data(dev,picH);		
-		write_data(dev,picL);				
-	 }	
+	//printk("===========%s  :  %s=============\n", __FUNCTION__, "run.");
+    int x, y;
+    u32 k;
+    u32 *p = (u32 *)(fbi->screen_base);
+    u16 c;
+    u8 *pp;
+    u16 *memory;
+    memory = kzalloc(240*2*240, GFP_KERNEL);	/* 申请内存 */
+    Address_set(spi,0,0,LCD_W-1,LCD_H-1);
+    write_command(spi,0x2C);
+    for (y = 0; y < fbi->var.yres; y++)
+    {
+        for (x = 0; x < fbi->var.xres; x++)
+        {
+            k = p[y*fbi->var.xres+x];//取出一个像素点的32位数据
+            // rgb8888 --> rgb565       
+            pp = (u8 *)&k;
+            c = pp[0] >> 3; //蓝色
+            c |= (pp[1]>>2)<<5; //绿色
+            c |= (pp[2]>>3)<<11; //红色
+            //发出像素数据的rgb565
+            *((u16 *)memory+x*fbi->var.yres+y) = ((c&0xff)<<8)|((c&0xff00)>>8);
+        }
+    }
+    //split 用于设置分批发送数据，有时候st7789spi速率跟不上容易丢数据，偶尔会提示spi2 send ....类似的错误
+    int count = 0,split=1;  
+    while (count < split)
+    {
+        write_datas(spi,(u8 *)memory+count*fbi->var.yres*fbi->var.xres*2/split,fbi->var.yres*fbi->var.xres*2/split);
+        count++;
+    }
+    kfree(memory);
 }
 
 /*
@@ -301,42 +426,26 @@ void st7735s_reginit(struct st7735s_dev *dev)
     //发命令，并发出命令所需的数据
     for (i = 0; i < ARRAY_SIZE(cmds); i++) //命令
     {
-        write_command(dev, cmds[i].reg_addr);
+        write_command(dev->private_data, cmds[i].reg_addr);
         for (j = 0; j < cmds[i].len; j++) //发出命令后，需要发出的数据
             if(cmds[i].len!=0)
-                write_data(dev, spi_lcd_datas[n++]);
+                write_data(dev->private_data, spi_lcd_datas[n++]);
         //printk("the n is %d\n",n);
         if (cmds[i].delay_ms) //如有延时则延时
             mdelay(cmds[i].delay_ms);
     }
 
 	/* 全屏颜色填充测试 */
-	LCD_Set_color(dev, WHITE);
-	mdelay(1000);
+	// LCD_Set_color(dev, WHITE);
+	// mdelay(1000);
 	LCD_Set_color(dev, RED);
-	mdelay(1000);
+	mdelay(500);
 	LCD_Set_color(dev, GREEN);
-	mdelay(1000);
+	mdelay(500);
 	LCD_Set_color(dev, BLUE);
-	mdelay(1000);
-	LCD_Set_color(dev, BLACK);
-	mdelay(1000);
-
-	/* 区域颜色填充测试 */
-	LCD_Set_area_color(dev,0,0,40,40,RED);
-	mdelay(1000);
-
-	/* 描点测试 */
-	for(i=0;i<100;++i)
-	{
-		LCD_Set_point_color(dev,i,i,RED);
-		LCD_Set_point_color(dev,100,i,GREEN);
-		LCD_Set_point_color(dev,i,100,BLUE);
-	}
-	mdelay(1000);
-
-	/* 图片显示测试 */
-	LCD_Set_image(dev, gImage_image);
+	mdelay(500);
+	// LCD_Set_color(dev, BLACK);
+	// mdelay(1000);
 
     printk("st7735s lcd init & test finish!\n");
 }
@@ -435,7 +544,7 @@ static int st7735s_probe(struct spi_device *spi)
 	st7735sdev.private_data = spi; /* 设置私有数据 */
 	/* 初始化st7735s内部寄存器 */
 	st7735s_reginit(&st7735sdev);		
-
+	st7735s_fb_create(spi); //fb设备初始化		
 	return 0;
 
 get_err:
@@ -458,6 +567,8 @@ get_err:
 static int st7735s_remove(struct spi_device *spi)
 {
 	printk("===========%s %d=============\n", __FUNCTION__, __LINE__);
+	/* 注销fb */
+	st7735s_fb_delete();
 	/* 删除设备 */
 	cdev_del(&st7735sdev.cdev);
 	unregister_chrdev_region(st7735sdev.devid, st7735s_CNT);

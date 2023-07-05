@@ -58,9 +58,11 @@
 ## spi_st7735s_org文件夹
     不使用framebuffer的驱动，直接加载编译好的ko模块即可看到效果。
     运行效果：
+ ![img](https://github.com/PIPIRay666/Linux_st7735s_lcd_driver/blob/main/pics/org.gif)
 ## spi_st7735s_fb文件夹
     基于framebuffer的驱动，fb_app.c为framebuffer测试APP源码，请加载编译好的ko模块后并运行fb_app。
     运行效果：
+![img](https://github.com/PIPIRay666/Linux_st7735s_lcd_driver/blob/main/pics/fb.gif)
 
 Makefile均位于文件夹内，按照移植的实际情况更改。
 
